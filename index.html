@@ -46,15 +46,67 @@
       overflow: visible;
     }
     .leaflet-popup-content-wrapper {
-      background: #111827; color: #e5e7eb; border-radius: 10px;
-      border: 1px solid #374151;
+      background: #0f172a; color: #e5e7eb; border-radius: 12px;
+      border: 1px solid rgba(100,180,255,0.28);
+      box-shadow: 0 8px 28px rgba(0,0,0,0.45);
     }
-    .leaflet-popup-tip { background: #111827; }
-    .leaflet-popup-content { margin: 10px 12px; font-size: 13px; line-height: 1.45; }
+    .leaflet-popup-tip { background: #0f172a; }
+    .leaflet-popup-content { margin: 12px 14px; font-size: 13px; line-height: 1.4; }
+    .leaflet-popup-close-button { color: #8cf !important; top: 6px !important; right: 8px !important; }
     .leaflet-control-zoom { border: none !important; }
     .leaflet-control-zoom a {
       background: rgba(10,10,26,0.9) !important; color: #8cf !important;
       border: 1px solid rgba(100,180,255,0.3) !important;
+    }
+
+    /* Aircraft popup layout */
+    .ac-popup { min-width: 210px; max-width: 270px; }
+    .ac-head {
+      display: flex; justify-content: space-between; align-items: baseline;
+      gap: 10px; padding-right: 14px; margin-bottom: 2px;
+    }
+    .ac-cs {
+      font-size: 16px; font-weight: 700; color: #fff;
+      letter-spacing: 0.04em; font-variant-numeric: tabular-nums;
+    }
+    .ac-type {
+      font-size: 11px; color: #7dd3fc; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      white-space: nowrap;
+    }
+    .ac-sub { font-size: 11px; color: #94a3b8; margin-bottom: 10px; }
+    .ac-route {
+      background: rgba(56, 189, 248, 0.08);
+      border: 1px solid rgba(100, 180, 255, 0.22);
+      border-radius: 9px;
+      padding: 8px 10px;
+      margin-bottom: 10px;
+    }
+    .ac-route-label {
+      font-size: 10px; text-transform: uppercase; letter-spacing: 0.08em;
+      color: #64748b; margin-bottom: 4px;
+    }
+    .ac-route-codes {
+      font-size: 15px; font-weight: 650; color: #f8fafc;
+      font-variant-numeric: tabular-nums; letter-spacing: 0.02em;
+    }
+    .ac-route-codes .arrow { color: #38bdf8; margin: 0 6px; font-weight: 500; }
+    .ac-route-cities { font-size: 11px; color: #94a3b8; margin-top: 3px; }
+    .ac-route-pending { font-size: 12px; color: #64748b; font-style: italic; }
+    .ac-grid {
+      display: grid;
+      grid-template-columns: 40px 1fr;
+      gap: 4px 10px;
+      font-size: 12px;
+    }
+    .ac-grid .k { color: #64748b; font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; padding-top: 1px; }
+    .ac-grid .v { color: #e2e8f0; font-variant-numeric: tabular-nums; }
+    .ac-grid .v .dim { color: #94a3b8; font-size: 11px; margin-left: 4px; }
+    .ac-vr-up { color: #4ade80; }
+    .ac-vr-dn { color: #fb923c; }
+    .ac-foot {
+      margin-top: 10px; padding-top: 8px;
+      border-top: 1px solid rgba(148, 163, 184, 0.15);
+      font-size: 11px; color: #64748b;
     }
   </style>
 </head>
@@ -163,20 +215,194 @@
       }
     }
 
-    function popupHTML(ac) {
-      const callsign = (ac.flight || ac.r || ac.hex || '—').trim();
-      const alt = ac.alt_baro != null ? Math.round(ac.alt_baro).toLocaleString() + ' ft' : '—';
-      const speed = ac.gs != null ? Math.round(ac.gs) + ' kts' : '—';
-      const track = ac.track != null ? Math.round(ac.track) + '°' : '—';
-      const type = ac.t || ac.desc || '—';
-      return `
-        <b style="font-size:15px">${callsign}</b><br>
-        Type: ${type}<br>
-        Alt: ${alt}<br>
-        Speed: ${speed}<br>
-        Track: ${track}<br>
-        Hex: ${ac.hex || '—'}
-      `;
+    function esc(s) {
+      return String(s ?? '')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;');
+    }
+
+    function compass16(deg) {
+      if (deg == null || !isFinite(deg)) return null;
+      const dirs = ['N','NNE','NE','ENE','E','ESE','SE','SSE','S','SSW','SW','WSW','W','WNW','NW','NNW'];
+      return dirs[Math.round(((deg % 360) + 360) % 360 / 22.5) % 16];
+    }
+
+    // Resolved routes from free adsbdb callsign lookup (origin / destination)
+    const routeResolved = new Map(); // CALLSIGN → route|null
+    const routeInflight = new Map(); // CALLSIGN → Promise
+
+    function callsignKey(ac) {
+      return (ac.flight || '').trim().toUpperCase();
+    }
+
+    async function ensureRoute(callsign) {
+      const cs = (callsign || '').trim().toUpperCase();
+      if (!cs || cs.length < 2) return null;
+      if (routeResolved.has(cs)) return routeResolved.get(cs);
+      if (routeInflight.has(cs)) return routeInflight.get(cs);
+
+      const p = (async () => {
+        try {
+          const res = await fetch(`https://api.adsbdb.com/v0/callsign/${encodeURIComponent(cs)}`);
+          if (!res.ok) {
+            routeResolved.set(cs, null);
+            return null;
+          }
+          const data = await res.json();
+          const fr = data?.response?.flightroute;
+          if (!fr?.origin) {
+            routeResolved.set(cs, null);
+            return null;
+          }
+          const pack = (ap) => ap ? {
+            iata: ap.iata_code || null,
+            icao: ap.icao_code || null,
+            city: ap.municipality || null,
+            name: ap.name || null
+          } : null;
+          const route = {
+            airline: fr.airline?.name || null,
+            origin: pack(fr.origin),
+            dest: pack(fr.destination)
+          };
+          routeResolved.set(cs, route);
+          return route;
+        } catch {
+          routeResolved.set(cs, null);
+          return null;
+        } finally {
+          routeInflight.delete(cs);
+        }
+      })();
+
+      routeInflight.set(cs, p);
+      return p;
+    }
+
+    function airportCode(ap) {
+      if (!ap) return '—';
+      return ap.iata || ap.icao || '—';
+    }
+
+    // route: undefined = still loading / not requested; null = unknown; object = known
+    function popupHTML(ac, route) {
+      const cs = (ac.flight || '').trim() || (ac.r || '').trim() || (ac.hex || '—').toUpperCase();
+      const reg = (ac.r || '').trim();
+      const typeCode = ac.t || '';
+      const typeDesc = ac.desc || '';
+      const typeLine = typeCode
+        ? (typeDesc ? `${typeCode}` : typeCode)
+        : (typeDesc || '—');
+      const operator = ac.ownOp || (route && route.airline) || '';
+
+      const altRaw = ac.alt_baro;
+      const alt = altRaw != null && altRaw !== 'ground'
+        ? `${Math.round(altRaw).toLocaleString()} ft`
+        : (altRaw === 'ground' ? 'Ground' : '—');
+
+      const vr = ac.baro_rate;
+      let vrHtml = '';
+      if (vr != null && isFinite(vr) && Math.abs(vr) >= 50) {
+        const cls = vr > 0 ? 'ac-vr-up' : 'ac-vr-dn';
+        const arrow = vr > 0 ? '↑' : '↓';
+        vrHtml = `<span class="${cls} dim">${arrow} ${Math.abs(Math.round(vr)).toLocaleString()} fpm</span>`;
+      }
+
+      const speed = ac.gs != null ? `${Math.round(ac.gs)} kts` : '—';
+      const track = ac.track != null ? `${Math.round(ac.track)}°` : '—';
+      const trackComp = ac.track != null ? compass16(ac.track) : null;
+      const trackStr = trackComp ? `${track}<span class="dim">${trackComp}</span>` : track;
+      const squawk = ac.squawk || '—';
+
+      let routeBlock;
+      if (route === undefined) {
+        routeBlock = `<div class="ac-route"><div class="ac-route-pending">Looking up route…</div></div>`;
+      } else if (!route || !route.origin) {
+        // Fallback: direction aircraft is coming from = opposite of track
+        const fromComp = ac.track != null ? compass16(ac.track + 180) : null;
+        routeBlock = fromComp
+          ? `<div class="ac-route">
+              <div class="ac-route-label">Coming from</div>
+              <div class="ac-route-codes">${esc(fromComp)}</div>
+              <div class="ac-route-cities">Route not in schedule DB</div>
+            </div>`
+          : `<div class="ac-route"><div class="ac-route-pending">Route unavailable</div></div>`;
+      } else {
+        const from = airportCode(route.origin);
+        const to = airportCode(route.dest);
+        const cities = [route.origin.city, route.dest?.city].filter(Boolean).join(' → ');
+        const fromName = route.origin.city || route.origin.name || from;
+        routeBlock = `<div class="ac-route">
+          <div class="ac-route-label">Coming from · route</div>
+          <div class="ac-route-codes">${esc(from)}<span class="arrow">→</span>${esc(to)}</div>
+          <div class="ac-route-cities">${esc(cities || fromName)}</div>
+        </div>`;
+      }
+
+      const subParts = [];
+      if (operator) subParts.push(esc(operator));
+      if (reg) subParts.push(esc(reg));
+      if (typeDesc && typeCode) subParts.push(esc(typeDesc));
+      const sub = subParts.join(' · ') || '—';
+
+      let foot = '';
+      if (ac.dst != null && isFinite(ac.dst)) {
+        const bearing = ac.dir != null ? compass16(ac.dir) : null;
+        foot = `<div class="ac-foot">${ac.dst.toFixed(0)} nm${bearing ? ' ' + bearing : ''} of Seattle</div>`;
+      }
+
+      return `<div class="ac-popup">
+        <div class="ac-head">
+          <span class="ac-cs">${esc(cs)}</span>
+          <span class="ac-type">${esc(typeLine)}</span>
+        </div>
+        <div class="ac-sub">${sub}</div>
+        ${routeBlock}
+        <div class="ac-grid">
+          <span class="k">Alt</span><span class="v">${esc(alt)}${vrHtml}</span>
+          <span class="k">Spd</span><span class="v">${esc(speed)}</span>
+          <span class="k">Hdg</span><span class="v">${trackStr}</span>
+          <span class="k">Sqk</span><span class="v">${esc(squawk)}</span>
+        </div>
+        ${foot}
+      </div>`;
+    }
+
+    function popupOptions() {
+      return { maxWidth: 300, minWidth: 220, className: 'ac-popup-wrap', autoPanPadding: [60, 60] };
+    }
+
+    // Live-update route section when popup is open
+    function wirePopupRoute(marker, id) {
+      marker.on('popupopen', async () => {
+        const p = aircraft[id];
+        if (!p?.ac) return;
+        const cs = callsignKey(p.ac);
+        if (!cs) {
+          marker.setPopupContent(popupHTML(p.ac, null));
+          return;
+        }
+        if (routeResolved.has(cs)) {
+          marker.setPopupContent(popupHTML(p.ac, routeResolved.get(cs)));
+        } else {
+          marker.setPopupContent(popupHTML(p.ac, undefined));
+        }
+        const route = await ensureRoute(cs);
+        if (aircraft[id] && marker.isPopupOpen()) {
+          marker.setPopupContent(popupHTML(aircraft[id].ac, route));
+        }
+      });
+    }
+
+    function currentRouteFor(ac) {
+      const cs = callsignKey(ac);
+      if (!cs) return null;
+      if (routeResolved.has(cs)) return routeResolved.get(cs);
+      // Kick off lookup in background for next open / next refresh
+      ensureRoute(cs);
+      return undefined;
     }
 
     function lerp(a, b, t) {
@@ -276,21 +502,27 @@
             p.targetLon = pred.lon;
             p.animStart = now;
             p.gs = ac.gs;
+            p.ac = ac;
             // fix* re-anchored when blend completes (see animate)
             p.fixLat = pred.lat;
             p.fixLon = pred.lon;
             p.fixTime = now;
 
             applyPlaneVisual(p, heading, ac.alt_baro);
-            p.marker.setPopupContent(popupHTML(ac));
+            const route = currentRouteFor(ac);
+            p.marker.setPopupContent(popupHTML(ac, route));
           } else {
             const heading = resolveHeading(ac, null, null, pred.lat, pred.lon, null);
+            const route = currentRouteFor(ac);
             const marker = L.marker([pred.lat, pred.lon], {
               icon: planeIcon(heading, ac.alt_baro)
-            }).bindPopup(popupHTML(ac)).addTo(map);
+            }).bindPopup(popupHTML(ac, route), popupOptions()).addTo(map);
+
+            wirePopupRoute(marker, id);
 
             aircraft[id] = {
               marker,
+              ac,
               lat: pred.lat,
               lon: pred.lon,
               track: heading,
