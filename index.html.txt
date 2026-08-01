@@ -1,0 +1,165 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="theme-color" content="#0a0a1a">
+  <title>Leo's Flight Radar</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body { height: 100%; background: #0a0a1a; font-family: -apple-system, system-ui, sans-serif; }
+    #map { width: 100%; height: 100%; }
+    #hud {
+      position: fixed; top: 12px; left: 12px; right: 12px; z-index: 1000;
+      background: rgba(10,10,26,0.88); color: #8cf;
+      padding: 10px 14px; border-radius: 12px;
+      font-size: 13px; backdrop-filter: blur(8px);
+      border: 1px solid rgba(100,180,255,0.25);
+      display: flex; justify-content: space-between; align-items: center;
+      pointer-events: none;
+    }
+    #hud b { color: #fff; }
+    .plane-icon {
+      font-size: 20px;
+      text-shadow: 0 0 6px currentColor;
+      line-height: 1;
+      text-align: center;
+    }
+    .leaflet-popup-content-wrapper {
+      background: #111827; color: #e5e7eb; border-radius: 10px;
+      border: 1px solid #374151;
+    }
+    .leaflet-popup-tip { background: #111827; }
+    .leaflet-popup-content { margin: 10px 12px; font-size: 13px; line-height: 1.45; }
+    .leaflet-control-zoom { border: none !important; }
+    .leaflet-control-zoom a {
+      background: rgba(10,10,26,0.9) !important; color: #8cf !important;
+      border: 1px solid rgba(100,180,255,0.3) !important;
+    }
+  </style>
+</head>
+<body>
+  <div id="hud">
+    <span>✈ <b id="count">—</b></span>
+    <span id="status">Loading…</span>
+  </div>
+  <div id="map"></div>
+
+  <script>
+    // ===== CONFIG (easy to change) =====
+    const HOME = { lat: 47.6062, lon: -122.3321 };   // Seattle
+    const RADIUS_NM = 100;                           // search radius in nautical miles
+    const REFRESH_MS = 18000;                        // 18 seconds
+
+    // ===== MAP =====
+    const map = L.map('map', {
+      center: [HOME.lat, HOME.lon],
+      zoom: 9,
+      zoomControl: false,
+      attributionControl: true
+    });
+
+    L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
+      attribution: '© OpenStreetMap © CARTO | Data: airplanes.live',
+      maxZoom: 18
+    }).addTo(map);
+
+    L.control.zoom({ position: 'bottomright' }).addTo(map);
+
+    // Home marker
+    L.circleMarker([HOME.lat, HOME.lon], {
+      radius: 6, color: '#3b82f6', fillColor: '#3b82f6', fillOpacity: 0.8, weight: 2
+    }).addTo(map).bindPopup('Home (Seattle)');
+
+    // ===== STATE =====
+    let markers = {};
+    let lastUpdate = 0;
+
+    function planeIcon(track, alt) {
+      let color = '#9ca3af';
+      if (alt != null) {
+        if (alt < 5000) color = '#22c55e';
+        else if (alt < 15000) color = '#eab308';
+        else if (alt < 30000) color = '#f97316';
+        else color = '#ef4444';
+      }
+      const rotation = (track || 0);
+      return L.divIcon({
+        className: '',
+        iconSize: [24, 24],
+        iconAnchor: [12, 12],
+        html: `<div class="plane-icon" style="color:${color}; transform:rotate(${rotation}deg)">✈</div>`
+      });
+    }
+
+    function popupHTML(ac) {
+      const callsign = (ac.flight || ac.r || ac.hex || '—').trim();
+      const alt = ac.alt_baro != null ? Math.round(ac.alt_baro).toLocaleString() + ' ft' : '—';
+      const speed = ac.gs != null ? Math.round(ac.gs) + ' kts' : '—';
+      const track = ac.track != null ? Math.round(ac.track) + '°' : '—';
+      const type = ac.t || ac.desc || '—';
+      return `
+        <b style="font-size:15px">${callsign}</b><br>
+        Type: ${type}<br>
+        Alt: ${alt}<br>
+        Speed: ${speed}<br>
+        Track: ${track}<br>
+        Hex: ${ac.hex || '—'}
+      `;
+    }
+
+    async function fetchFlights() {
+      const url = `https://api.airplanes.live/v2/point/${HOME.lat}/${HOME.lon}/${RADIUS_NM}`;
+      try {
+        const res = await fetch(url);
+        if (!res.ok) throw new Error(res.status);
+        const data = await res.json();
+        const aircraft = data.ac || [];
+
+        // Remove markers that are no longer present
+        const seen = new Set();
+        aircraft.forEach(ac => {
+          if (ac.lat == null || ac.lon == null) return;
+          const id = ac.hex || (ac.flight + ac.lat);
+          seen.add(id);
+
+          if (markers[id]) {
+            markers[id].setLatLng([ac.lat, ac.lon]);
+            markers[id].setIcon(planeIcon(ac.track, ac.alt_baro));
+            markers[id].setPopupContent(popupHTML(ac));
+          } else {
+            const m = L.marker([ac.lat, ac.lon], {
+              icon: planeIcon(ac.track, ac.alt_baro)
+            }).bindPopup(popupHTML(ac));
+            m.addTo(map);
+            markers[id] = m;
+          }
+        });
+
+        // Clean up disappeared aircraft
+        Object.keys(markers).forEach(id => {
+          if (!seen.has(id)) {
+            map.removeLayer(markers[id]);
+            delete markers[id];
+          }
+        });
+
+        document.getElementById('count').textContent = aircraft.length;
+        document.getElementById('status').textContent =
+          new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+        lastUpdate = Date.now();
+      } catch (err) {
+        console.error(err);
+        document.getElementById('status').textContent = 'Error – retrying…';
+      }
+    }
+
+    // Initial load + interval
+    fetchFlights();
+    setInterval(fetchFlights, REFRESH_MS);
+  </script>
+</body>
+</html>
