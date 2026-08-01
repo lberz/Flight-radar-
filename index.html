@@ -53,8 +53,9 @@
     // ===== CONFIG =====
     const HOME = { lat: 47.6062, lon: -122.3321 };   // Seattle
     const RADIUS_NM = 100;
-    const REFRESH_MS = 8000;        // Faster refresh (8 seconds)
-    const ANIMATION_MS = 2200;      // How long the glide animation takes
+    const REFRESH_MS = 5000;        // Poll every 5s (was 8s)
+    const ANIMATION_MS = 1200;      // Blend duration when a new API fix arrives
+    // Dead-reckon between polls using ground speed + track so icons keep moving
 
     // ===== MAP =====
     const map = L.map('map', {
@@ -76,7 +77,9 @@
     }).addTo(map).bindPopup('Home (Seattle)');
 
     // ===== STATE =====
-    const aircraft = {};   // id → { marker, lat, lon, track, alt, targetLat, targetLon, startLat, startLon, animStart }
+    // id → { marker, lat, lon, track, alt, gs, fixLat, fixLon, fixTime,
+    //         startLat, startLon, targetLat, targetLon, animStart }
+    const aircraft = {};
 
     function planeIcon(track, alt) {
       let color = '#9ca3af';
@@ -110,33 +113,70 @@
       `;
     }
 
-    // Smooth interpolation helper
     function lerp(a, b, t) {
       return a + (b - a) * t;
     }
 
-    // Animation loop – runs continuously
+    // Move lat/lon along track (deg) by ground speed (knots) for dtMs milliseconds
+    function deadReckon(lat, lon, trackDeg, gsKnots, dtMs) {
+      if (lat == null || lon == null || trackDeg == null || gsKnots == null || !(gsKnots > 0) || dtMs <= 0) {
+        return { lat, lon };
+      }
+      // nm traveled; 1 nm ≈ 1/60 deg latitude
+      const nm = (gsKnots * dtMs) / 3_600_000;
+      const rad = trackDeg * Math.PI / 180;
+      const dLat = (nm * Math.cos(rad)) / 60;
+      const cosLat = Math.cos(lat * Math.PI / 180);
+      const dLon = cosLat === 0 ? 0 : (nm * Math.sin(rad)) / (60 * cosLat);
+      return { lat: lat + dLat, lon: lon + dLon };
+    }
+
+    // Predicted position at "now" from last ADS-B fix (optionally aged by seen_pos)
+    function predictedFromFix(ac, nowMs) {
+      let ageMs = 0;
+      if (ac.seen_pos != null && isFinite(ac.seen_pos)) {
+        ageMs = Math.max(0, ac.seen_pos * 1000);
+      }
+      // Also project forward a short blend so the target is where the plane will be
+      // when the ease-out finishes (reduces stop-and-go feel)
+      ageMs += ANIMATION_MS * 0.35;
+      return deadReckon(ac.lat, ac.lon, ac.track, ac.gs, ageMs);
+    }
+
+    // Animation loop – blend to new fixes, then keep coasting via dead reckoning
     function animate() {
       const now = performance.now();
 
       Object.values(aircraft).forEach(plane => {
-        if (!plane.animStart) return;
+        if (plane.animStart) {
+          const elapsed = now - plane.animStart;
+          let t = Math.min(elapsed / ANIMATION_MS, 1);
+          // Ease-out cubic
+          t = 1 - Math.pow(1 - t, 3);
 
-        const elapsed = now - plane.animStart;
-        let t = Math.min(elapsed / ANIMATION_MS, 1);
+          const lat = lerp(plane.startLat, plane.targetLat, t);
+          const lon = lerp(plane.startLon, plane.targetLon, t);
 
-        // Ease-out cubic for nicer feel
-        t = 1 - Math.pow(1 - t, 3);
+          plane.marker.setLatLng([lat, lon]);
+          plane.lat = lat;
+          plane.lon = lon;
 
-        const lat = lerp(plane.startLat, plane.targetLat, t);
-        const lon = lerp(plane.startLon, plane.targetLon, t);
+          if (t >= 1) {
+            plane.animStart = null;
+            // Anchor dead reckoning from settled position
+            plane.fixLat = lat;
+            plane.fixLon = lon;
+            plane.fixTime = now;
+          }
+          return;
+        }
 
-        plane.marker.setLatLng([lat, lon]);
-        plane.lat = lat;
-        plane.lon = lon;
-
-        if (t >= 1) {
-          plane.animStart = null; // animation finished
+        // Between API updates: coast using last ground speed + track
+        if (plane.gs != null && plane.track != null && plane.fixTime != null) {
+          const pred = deadReckon(plane.fixLat, plane.fixLon, plane.track, plane.gs, now - plane.fixTime);
+          plane.marker.setLatLng([pred.lat, pred.lon]);
+          plane.lat = pred.lat;
+          plane.lon = pred.lon;
         }
       });
 
@@ -152,49 +192,56 @@
         const data = await res.json();
         const list = data.ac || [];
         const seen = new Set();
+        const now = performance.now();
 
         list.forEach(ac => {
           if (ac.lat == null || ac.lon == null) return;
           const id = ac.hex || (ac.flight + '_' + Math.round(ac.lat * 1000));
 
           seen.add(id);
+          const pred = predictedFromFix(ac, now);
 
           if (aircraft[id]) {
-            // Existing plane → start smooth move to new position
             const p = aircraft[id];
             p.startLat = p.lat;
             p.startLon = p.lon;
-            p.targetLat = ac.lat;
-            p.targetLon = ac.lon;
-            p.animStart = performance.now();
+            p.targetLat = pred.lat;
+            p.targetLon = pred.lon;
+            p.animStart = now;
             p.track = ac.track;
             p.alt = ac.alt_baro;
+            p.gs = ac.gs;
+            // fix* re-anchored when blend completes (see animate)
+            p.fixLat = pred.lat;
+            p.fixLon = pred.lon;
+            p.fixTime = now;
 
-            // Update icon (heading + color) immediately
             p.marker.setIcon(planeIcon(ac.track, ac.alt_baro));
             p.marker.setPopupContent(popupHTML(ac));
           } else {
-            // Brand new plane
-            const marker = L.marker([ac.lat, ac.lon], {
+            const marker = L.marker([pred.lat, pred.lon], {
               icon: planeIcon(ac.track, ac.alt_baro)
             }).bindPopup(popupHTML(ac)).addTo(map);
 
             aircraft[id] = {
               marker,
-              lat: ac.lat,
-              lon: ac.lon,
+              lat: pred.lat,
+              lon: pred.lon,
               track: ac.track,
               alt: ac.alt_baro,
-              targetLat: ac.lat,
-              targetLon: ac.lon,
-              startLat: ac.lat,
-              startLon: ac.lon,
+              gs: ac.gs,
+              fixLat: pred.lat,
+              fixLon: pred.lon,
+              fixTime: now,
+              targetLat: pred.lat,
+              targetLon: pred.lon,
+              startLat: pred.lat,
+              startLon: pred.lon,
               animStart: null
             };
           }
         });
 
-        // Remove planes that disappeared
         Object.keys(aircraft).forEach(id => {
           if (!seen.has(id)) {
             map.removeLayer(aircraft[id].marker);
