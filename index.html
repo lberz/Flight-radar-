@@ -27,6 +27,7 @@
       text-shadow: 0 0 6px currentColor;
       line-height: 1;
       text-align: center;
+      transition: transform 0.4s ease;
     }
     .leaflet-popup-content-wrapper {
       background: #111827; color: #e5e7eb; border-radius: 10px;
@@ -49,10 +50,11 @@
   <div id="map"></div>
 
   <script>
-    // ===== CONFIG (easy to change) =====
+    // ===== CONFIG =====
     const HOME = { lat: 47.6062, lon: -122.3321 };   // Seattle
-    const RADIUS_NM = 100;                           // search radius in nautical miles
-    const REFRESH_MS = 18000;                        // 18 seconds
+    const RADIUS_NM = 100;
+    const REFRESH_MS = 8000;        // Faster refresh (8 seconds)
+    const ANIMATION_MS = 2200;      // How long the glide animation takes
 
     // ===== MAP =====
     const map = L.map('map', {
@@ -69,14 +71,12 @@
 
     L.control.zoom({ position: 'bottomright' }).addTo(map);
 
-    // Home marker
     L.circleMarker([HOME.lat, HOME.lon], {
       radius: 6, color: '#3b82f6', fillColor: '#3b82f6', fillOpacity: 0.8, weight: 2
     }).addTo(map).bindPopup('Home (Seattle)');
 
     // ===== STATE =====
-    let markers = {};
-    let lastUpdate = 0;
+    const aircraft = {};   // id → { marker, lat, lon, track, alt, targetLat, targetLon, startLat, startLon, animStart }
 
     function planeIcon(track, alt) {
       let color = '#9ca3af';
@@ -86,12 +86,11 @@
         else if (alt < 30000) color = '#f97316';
         else color = '#ef4444';
       }
-      const rotation = (track || 0);
       return L.divIcon({
         className: '',
         iconSize: [24, 24],
         iconAnchor: [12, 12],
-        html: `<div class="plane-icon" style="color:${color}; transform:rotate(${rotation}deg)">✈</div>`
+        html: `<div class="plane-icon" style="color:${color}; transform:rotate(${track || 0}deg)">✈</div>`
       });
     }
 
@@ -111,53 +110,108 @@
       `;
     }
 
+    // Smooth interpolation helper
+    function lerp(a, b, t) {
+      return a + (b - a) * t;
+    }
+
+    // Animation loop – runs continuously
+    function animate() {
+      const now = performance.now();
+
+      Object.values(aircraft).forEach(plane => {
+        if (!plane.animStart) return;
+
+        const elapsed = now - plane.animStart;
+        let t = Math.min(elapsed / ANIMATION_MS, 1);
+
+        // Ease-out cubic for nicer feel
+        t = 1 - Math.pow(1 - t, 3);
+
+        const lat = lerp(plane.startLat, plane.targetLat, t);
+        const lon = lerp(plane.startLon, plane.targetLon, t);
+
+        plane.marker.setLatLng([lat, lon]);
+        plane.lat = lat;
+        plane.lon = lon;
+
+        if (t >= 1) {
+          plane.animStart = null; // animation finished
+        }
+      });
+
+      requestAnimationFrame(animate);
+    }
+    requestAnimationFrame(animate);
+
     async function fetchFlights() {
       const url = `https://api.airplanes.live/v2/point/${HOME.lat}/${HOME.lon}/${RADIUS_NM}`;
       try {
         const res = await fetch(url);
         if (!res.ok) throw new Error(res.status);
         const data = await res.json();
-        const aircraft = data.ac || [];
-
-        // Remove markers that are no longer present
+        const list = data.ac || [];
         const seen = new Set();
-        aircraft.forEach(ac => {
+
+        list.forEach(ac => {
           if (ac.lat == null || ac.lon == null) return;
-          const id = ac.hex || (ac.flight + ac.lat);
+          const id = ac.hex || (ac.flight + '_' + Math.round(ac.lat * 1000));
+
           seen.add(id);
 
-          if (markers[id]) {
-            markers[id].setLatLng([ac.lat, ac.lon]);
-            markers[id].setIcon(planeIcon(ac.track, ac.alt_baro));
-            markers[id].setPopupContent(popupHTML(ac));
+          if (aircraft[id]) {
+            // Existing plane → start smooth move to new position
+            const p = aircraft[id];
+            p.startLat = p.lat;
+            p.startLon = p.lon;
+            p.targetLat = ac.lat;
+            p.targetLon = ac.lon;
+            p.animStart = performance.now();
+            p.track = ac.track;
+            p.alt = ac.alt_baro;
+
+            // Update icon (heading + color) immediately
+            p.marker.setIcon(planeIcon(ac.track, ac.alt_baro));
+            p.marker.setPopupContent(popupHTML(ac));
           } else {
-            const m = L.marker([ac.lat, ac.lon], {
+            // Brand new plane
+            const marker = L.marker([ac.lat, ac.lon], {
               icon: planeIcon(ac.track, ac.alt_baro)
-            }).bindPopup(popupHTML(ac));
-            m.addTo(map);
-            markers[id] = m;
+            }).bindPopup(popupHTML(ac)).addTo(map);
+
+            aircraft[id] = {
+              marker,
+              lat: ac.lat,
+              lon: ac.lon,
+              track: ac.track,
+              alt: ac.alt_baro,
+              targetLat: ac.lat,
+              targetLon: ac.lon,
+              startLat: ac.lat,
+              startLon: ac.lon,
+              animStart: null
+            };
           }
         });
 
-        // Clean up disappeared aircraft
-        Object.keys(markers).forEach(id => {
+        // Remove planes that disappeared
+        Object.keys(aircraft).forEach(id => {
           if (!seen.has(id)) {
-            map.removeLayer(markers[id]);
-            delete markers[id];
+            map.removeLayer(aircraft[id].marker);
+            delete aircraft[id];
           }
         });
 
-        document.getElementById('count').textContent = aircraft.length;
+        document.getElementById('count').textContent = list.length;
         document.getElementById('status').textContent =
           new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
-        lastUpdate = Date.now();
       } catch (err) {
         console.error(err);
         document.getElementById('status').textContent = 'Error – retrying…';
       }
     }
 
-    // Initial load + interval
+    // Start
     fetchFlights();
     setInterval(fetchFlights, REFRESH_MS);
   </script>
