@@ -110,6 +110,20 @@
     .ac-route-note {
       margin-top: 8px; font-size: 10px; color: #64748b; line-height: 1.3;
     }
+    .ac-links {
+      display: flex; flex-wrap: wrap; gap: 8px;
+      margin-top: 10px;
+    }
+    .ac-link {
+      display: inline-block;
+      font-size: 11px; font-weight: 600;
+      color: #0f172a !important;
+      background: #7dd3fc;
+      text-decoration: none !important;
+      padding: 5px 9px; border-radius: 999px;
+      pointer-events: auto;
+    }
+    .ac-link:hover { background: #bae6fd; }
     .ac-grid {
       display: grid;
       grid-template-columns: 40px 1fr;
@@ -142,6 +156,10 @@
     const REFRESH_MS = 5000;        // Poll every 5s (was 8s)
     const ANIMATION_MS = 1200;      // Blend duration when a new API fix arrives
     // Dead-reckon between polls using ground speed + track so icons keep moving
+    // Optional CORS proxy for OpenSky live airports, e.g. a Cloudflare Worker that
+    // fetches the URL and returns JSON with Access-Control-Allow-Origin: *.
+    // Leave empty to try direct + public relays; Google/FlightAware links always work.
+    const OPENSKY_PROXY = '';       // e.g. 'https://YOUR_SUBDOMAIN.workers.dev/?url='
 
     // ===== MAP =====
     const map = L.map('map', {
@@ -247,56 +265,160 @@
       return dirs[Math.round(((deg % 360) + 360) % 360 / 22.5) % 16];
     }
 
-    // Resolved routes from free adsbdb callsign lookup (origin / destination)
-    const routeResolved = new Map(); // CALLSIGN → route|null
-    const routeInflight = new Map(); // CALLSIGN → Promise
+    // ===== ROUTE (accuracy-first) =====
+    // Problem: free callsign "schedule" DBs invent typical routes that often don't
+    // match the live flight (wrong vs Google / FlightAware). Geometry guesses are
+    // also frequently wrong at cruise.
+    //
+    // Approach:
+    //  1) On popup open only, query OpenSky Network for THIS airframe's live flight
+    //     (estDepartureAirport / estArrivalAirport from real track history).
+    //  2) OpenSky blocks browser CORS from arbitrary origins — try a couple of
+    //     public GET proxies, then direct (works if CORS ever allows / local proxy).
+    //  3) Never show a guessed airport. If we don't know, say so and offer one-click
+    //     Google + FlightAware links (same places you'd double-check by hand).
 
     function callsignKey(ac) {
       return (ac.flight || '').trim().toUpperCase();
     }
 
-    async function ensureRoute(callsign) {
-      const cs = (callsign || '').trim().toUpperCase();
-      if (!cs || cs.length < 2) return null;
-      if (routeResolved.has(cs)) return routeResolved.get(cs);
-      if (routeInflight.has(cs)) return routeInflight.get(cs);
+    // ICAO airline → IATA (for nicer Google queries). Incomplete on purpose.
+    const ICAO_TO_IATA = {
+      ASA:'AS', UAL:'UA', AAL:'AA', DAL:'DL', SWA:'WN', JBU:'B6', NKS:'NK', FFT:'F9',
+      SCX:'SY', SKW:'OO', QXE:'QX', HAL:'HA', CPA:'CX', ANZ:'NZ', BAW:'BA', AFR:'AF',
+      DLH:'LH', UAE:'EK', QTR:'QR', SIA:'SQ', KAL:'KE', AAR:'OZ', JAL:'JL', ANA:'NH',
+      ACA:'AC', WJA:'WS', JZA:'QK', ENY:'MQ', RPA:'YX', PDT:'PT', GJS:'G7', ASH:'YV',
+      FFT:'F9', VRD:'VX', AAY:'G4', JIA:'OH', EDV:'9E', GTI:'5Y', CLX:'CV', BOX:'3S',
+      FDX:'FX', UPS:'5X', GTI:'5Y', CKS:'K4', ABX:'GB', ATN:'8C', CFG:'DE', TOM:'BY',
+      ICE:'FI', FIN:'AY', SAS:'SK', IBE:'IB', VLG:'VY', RYR:'FR', EZY:'U2', BAW:'BA',
+      QFA:'QF', VOZ:'VA', JST:'JQ', CES:'MU', CCA:'CA', CSN:'CZ', CXA:'MF', CAL:'CI',
+      EVA:'BR', THA:'TG', MAS:'MH', PAL:'PR', SWR:'LX', AUA:'OS', TAP:'TP', AZA:'AZ',
+      ITY:'AZ', VIR:'VS', EIN:'EI', AEA:'UX', RAM:'AT', ETH:'ET', SAA:'SA', KQA:'KQ',
+      AMX:'AM', VOI:'Y4', TAO:'VW', AIJ:'4O', WJA:'WS', TSC:'TS', FLE:'F8', ROU:'RV'
+    };
 
-      const p = (async () => {
-        try {
-          const res = await fetch(`https://api.adsbdb.com/v0/callsign/${encodeURIComponent(cs)}`);
-          if (!res.ok) {
-            routeResolved.set(cs, null);
-            return null;
-          }
-          const data = await res.json();
-          const fr = data?.response?.flightroute;
-          if (!fr || (!fr.origin && !fr.destination)) {
-            routeResolved.set(cs, null);
-            return null;
-          }
-          const pack = (ap) => ap ? {
-            iata: ap.iata_code || null,
-            icao: ap.icao_code || null,
-            city: ap.municipality || null,
-            name: ap.name || null
-          } : null;
-          const route = {
-            airline: fr.airline?.name || null,
-            origin: pack(fr.origin),
-            dest: pack(fr.destination)
-          };
-          routeResolved.set(cs, route);
-          return route;
-        } catch {
-          routeResolved.set(cs, null);
-          return null;
-        } finally {
-          routeInflight.delete(cs);
-        }
-      })();
+    function iataFlightNumber(callsign) {
+      const cs = (callsign || '').trim().toUpperCase().replace(/\s+/g, '');
+      if (!cs) return '';
+      // Already looks like IATA (2 letters + digits), e.g. AS667
+      if (/^[A-Z]{2}\d{1,4}[A-Z]?$/.test(cs)) return cs;
+      // ICAO airline (3 letters) + flight number
+      const m = cs.match(/^([A-Z]{3})(\d{1,4}[A-Z]?)$/);
+      if (m && ICAO_TO_IATA[m[1]]) return ICAO_TO_IATA[m[1]] + m[2];
+      return cs;
+    }
 
-      routeInflight.set(cs, p);
-      return p;
+    // Keep a modest airport dictionary ONLY to pretty-print ICAO codes from OpenSky
+    const AIRPORTS = [
+      { icao:'KSEA', iata:'SEA', city:'Seattle', name:'Seattle-Tacoma Intl' },
+      { icao:'KBFI', iata:'BFI', city:'Seattle', name:'Boeing Field' },
+      { icao:'KPAE', iata:'PAE', city:'Everett', name:'Paine Field' },
+      { icao:'KPDX', iata:'PDX', city:'Portland', name:'Portland Intl' },
+      { icao:'KGEG', iata:'GEG', city:'Spokane', name:'Spokane Intl' },
+      { icao:'KBLI', iata:'BLI', city:'Bellingham', name:'Bellingham Intl' },
+      { icao:'KPSC', iata:'PSC', city:'Pasco', name:'Tri-Cities' },
+      { icao:'KYKM', iata:'YKM', city:'Yakima', name:'Yakima Air Terminal' },
+      { icao:'KBOI', iata:'BOI', city:'Boise', name:'Boise Air Terminal' },
+      { icao:'KMFR', iata:'MFR', city:'Medford', name:'Rogue Valley Intl' },
+      { icao:'KEUG', iata:'EUG', city:'Eugene', name:'Mahlon Sweet Field' },
+      { icao:'KRDM', iata:'RDM', city:'Redmond', name:'Roberts Field' },
+      { icao:'KMSO', iata:'MSO', city:'Missoula', name:'Missoula Montana' },
+      { icao:'KBIL', iata:'BIL', city:'Billings', name:'Billings Logan Intl' },
+      { icao:'KFCA', iata:'FCA', city:'Kalispell', name:'Glacier Park Intl' },
+      { icao:'KGTF', iata:'GTF', city:'Great Falls', name:'Great Falls Intl' },
+      { icao:'CYVR', iata:'YVR', city:'Vancouver', name:'Vancouver Intl' },
+      { icao:'CYYJ', iata:'YYJ', city:'Victoria', name:'Victoria Intl' },
+      { icao:'CYLW', iata:'YLW', city:'Kelowna', name:'Kelowna Intl' },
+      { icao:'CYYC', iata:'YYC', city:'Calgary', name:'Calgary Intl' },
+      { icao:'CYEG', iata:'YEG', city:'Edmonton', name:'Edmonton Intl' },
+      { icao:'CYYZ', iata:'YYZ', city:'Toronto', name:'Toronto Pearson Intl' },
+      { icao:'CYUL', iata:'YUL', city:'Montreal', name:'Montréal-Trudeau' },
+      { icao:'CYWG', iata:'YWG', city:'Winnipeg', name:'Winnipeg Richardson Intl' },
+      { icao:'PANC', iata:'ANC', city:'Anchorage', name:'Ted Stevens Anchorage' },
+      { icao:'PAFA', iata:'FAI', city:'Fairbanks', name:'Fairbanks Intl' },
+      { icao:'PAJN', iata:'JNU', city:'Juneau', name:'Juneau Intl' },
+      { icao:'PAKT', iata:'KTN', city:'Ketchikan', name:'Ketchikan Intl' },
+      { icao:'PHNL', iata:'HNL', city:'Honolulu', name:'Daniel K. Inouye Intl' },
+      { icao:'PHOG', iata:'OGG', city:'Kahului', name:'Kahului' },
+      { icao:'PHKO', iata:'KOA', city:'Kailua-Kona', name:'Kona Intl' },
+      { icao:'PHLI', iata:'LIH', city:'Lihue', name:'Lihue' },
+      { icao:'KSFO', iata:'SFO', city:'San Francisco', name:'San Francisco Intl' },
+      { icao:'KOAK', iata:'OAK', city:'Oakland', name:'Metro Oakland Intl' },
+      { icao:'KSJC', iata:'SJC', city:'San Jose', name:'Norman Y. Mineta' },
+      { icao:'KSMF', iata:'SMF', city:'Sacramento', name:'Sacramento Intl' },
+      { icao:'KLAX', iata:'LAX', city:'Los Angeles', name:'Los Angeles Intl' },
+      { icao:'KSAN', iata:'SAN', city:'San Diego', name:'San Diego Intl' },
+      { icao:'KSNA', iata:'SNA', city:'Santa Ana', name:'John Wayne' },
+      { icao:'KBUR', iata:'BUR', city:'Burbank', name:'Hollywood Burbank' },
+      { icao:'KONT', iata:'ONT', city:'Ontario', name:'Ontario Intl' },
+      { icao:'KLAS', iata:'LAS', city:'Las Vegas', name:'Harry Reid Intl' },
+      { icao:'KRNO', iata:'RNO', city:'Reno', name:'Reno-Tahoe Intl' },
+      { icao:'KPHX', iata:'PHX', city:'Phoenix', name:'Phoenix Sky Harbor' },
+      { icao:'KTUS', iata:'TUS', city:'Tucson', name:'Tucson Intl' },
+      { icao:'KABQ', iata:'ABQ', city:'Albuquerque', name:'Sunport' },
+      { icao:'KSLC', iata:'SLC', city:'Salt Lake City', name:'Salt Lake City Intl' },
+      { icao:'KDEN', iata:'DEN', city:'Denver', name:'Denver Intl' },
+      { icao:'KORD', iata:'ORD', city:'Chicago', name:"O'Hare Intl" },
+      { icao:'KMDW', iata:'MDW', city:'Chicago', name:'Midway Intl' },
+      { icao:'KMSP', iata:'MSP', city:'Minneapolis', name:'Minneapolis-St Paul Intl' },
+      { icao:'KDTW', iata:'DTW', city:'Detroit', name:'Detroit Metro' },
+      { icao:'KDFW', iata:'DFW', city:'Dallas', name:'Dallas/Fort Worth Intl' },
+      { icao:'KDAL', iata:'DAL', city:'Dallas', name:'Dallas Love Field' },
+      { icao:'KIAH', iata:'IAH', city:'Houston', name:'George Bush Intercontinental' },
+      { icao:'KHOU', iata:'HOU', city:'Houston', name:'William P. Hobby' },
+      { icao:'KAUS', iata:'AUS', city:'Austin', name:'Austin-Bergstrom Intl' },
+      { icao:'KSAT', iata:'SAT', city:'San Antonio', name:'San Antonio Intl' },
+      { icao:'KATL', iata:'ATL', city:'Atlanta', name:'Hartsfield-Jackson Atlanta' },
+      { icao:'KCLT', iata:'CLT', city:'Charlotte', name:'Charlotte Douglas Intl' },
+      { icao:'KMCO', iata:'MCO', city:'Orlando', name:'Orlando Intl' },
+      { icao:'KMIA', iata:'MIA', city:'Miami', name:'Miami Intl' },
+      { icao:'KFLL', iata:'FLL', city:'Fort Lauderdale', name:'Fort Lauderdale-Hollywood' },
+      { icao:'KTPA', iata:'TPA', city:'Tampa', name:'Tampa Intl' },
+      { icao:'KJFK', iata:'JFK', city:'New York', name:'John F. Kennedy Intl' },
+      { icao:'KEWR', iata:'EWR', city:'Newark', name:'Newark Liberty Intl' },
+      { icao:'KLGA', iata:'LGA', city:'New York', name:'LaGuardia' },
+      { icao:'KBOS', iata:'BOS', city:'Boston', name:'Logan Intl' },
+      { icao:'KPHL', iata:'PHL', city:'Philadelphia', name:'Philadelphia Intl' },
+      { icao:'KBWI', iata:'BWI', city:'Baltimore', name:'Baltimore/Washington Intl' },
+      { icao:'KIAD', iata:'IAD', city:'Washington', name:'Washington Dulles Intl' },
+      { icao:'KDCA', iata:'DCA', city:'Washington', name:'Ronald Reagan Washington' },
+      { icao:'KSEA', iata:'SEA', city:'Seattle', name:'Seattle-Tacoma Intl' },
+      { icao:'KSTL', iata:'STL', city:'St. Louis', name:'St. Louis Lambert Intl' },
+      { icao:'KMCI', iata:'MCI', city:'Kansas City', name:'Kansas City Intl' },
+      { icao:'KIND', iata:'IND', city:'Indianapolis', name:'Indianapolis Intl' },
+      { icao:'KCVG', iata:'CVG', city:'Cincinnati', name:'Cincinnati/Northern Kentucky' },
+      { icao:'KBNA', iata:'BNA', city:'Nashville', name:'Nashville Intl' },
+      { icao:'KMEM', iata:'MEM', city:'Memphis', name:'Memphis Intl' },
+      { icao:'KMSY', iata:'MSY', city:'New Orleans', name:'Louis Armstrong New Orleans' },
+      { icao:'KRDU', iata:'RDU', city:'Raleigh', name:'Raleigh-Durham Intl' },
+      { icao:'MMMX', iata:'MEX', city:'Mexico City', name:'Mexico City Intl' },
+      { icao:'MMUN', iata:'CUN', city:'Cancún', name:'Cancún Intl' },
+      { icao:'MMSD', iata:'SJD', city:'San José del Cabo', name:'Los Cabos Intl' },
+      { icao:'MMPR', iata:'PVR', city:'Puerto Vallarta', name:'Puerto Vallarta Intl' },
+      { icao:'RJTT', iata:'HND', city:'Tokyo', name:'Tokyo Haneda' },
+      { icao:'RJAA', iata:'NRT', city:'Tokyo', name:'Narita Intl' },
+      { icao:'RKSI', iata:'ICN', city:'Seoul', name:'Incheon Intl' },
+      { icao:'VHHH', iata:'HKG', city:'Hong Kong', name:'Hong Kong Intl' },
+      { icao:'RCTP', iata:'TPE', city:'Taipei', name:'Taiwan Taoyuan Intl' },
+      { icao:'ZSPD', iata:'PVG', city:'Shanghai', name:'Shanghai Pudong Intl' },
+      { icao:'ZBAA', iata:'PEK', city:'Beijing', name:'Beijing Capital Intl' },
+      { icao:'WSSS', iata:'SIN', city:'Singapore', name:'Singapore Changi' },
+      { icao:'EGLL', iata:'LHR', city:'London', name:'London Heathrow' },
+      { icao:'EHAM', iata:'AMS', city:'Amsterdam', name:'Amsterdam Schiphol' },
+      { icao:'EDDF', iata:'FRA', city:'Frankfurt', name:'Frankfurt am Main' },
+      { icao:'LFPG', iata:'CDG', city:'Paris', name:'Charles de Gaulle' },
+      { icao:'LTFM', iata:'IST', city:'Istanbul', name:'Istanbul Airport' },
+      { icao:'OMDB', iata:'DXB', city:'Dubai', name:'Dubai Intl' },
+      { icao:'YSSY', iata:'SYD', city:'Sydney', name:'Sydney Kingsford Smith' },
+      { icao:'YMML', iata:'MEL', city:'Melbourne', name:'Melbourne Intl' },
+      { icao:'NZAA', iata:'AKL', city:'Auckland', name:'Auckland Intl' }
+    ];
+    const AIRPORT_BY_ICAO = new Map(AIRPORTS.map(a => [a.icao, a]));
+
+    function lookupAirport(code) {
+      if (!code) return null;
+      const c = String(code).trim().toUpperCase();
+      return AIRPORT_BY_ICAO.get(c) || { icao: c, iata: null, city: null, name: c };
     }
 
     function airportCode(ap) {
@@ -309,18 +431,199 @@
       return ap.city || ap.name || '';
     }
 
-    // One side of the From / Landing pair
-    function legHTML(kind, label, main, sub, noteClass) {
+    // OpenSky live flight cache: hex → { at, route }
+    const openSkyCache = new Map();
+    const openSkyInflight = new Map();
+    const OPENSKY_TTL_MS = 10 * 60 * 1000;
+
+    async function fetchJson(url) {
+      const res = await fetch(url, { cache: 'no-store' });
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      return res.json();
+    }
+
+    // Try to read OpenSky despite CORS. Order:
+    //  1) direct (works if OpenSky allows origin, or via local reverse proxy)
+    //  2) allorigins get wrapper
+    async function fetchOpenSkyFlights(hex) {
+      const now = Math.floor(Date.now() / 1000);
+      const begin = now - 12 * 3600; // last 12h covers long-haul departures
+      const target = `https://opensky-network.org/api/flights/aircraft?icao24=${encodeURIComponent(hex)}&begin=${begin}&end=${now}`;
+
+      // Optional user-provided CORS proxy (most reliable in-browser path)
+      if (OPENSKY_PROXY) {
+        try {
+          const data = await fetchJson(OPENSKY_PROXY + encodeURIComponent(target));
+          if (Array.isArray(data)) return data;
+          // Some proxies wrap as { contents: "..." } or { data: [...] }
+          if (Array.isArray(data?.data)) return data.data;
+          if (typeof data?.contents === 'string') {
+            const inner = JSON.parse(data.contents);
+            if (Array.isArray(inner)) return inner;
+          }
+        } catch { /* fall through */ }
+      }
+
+      // Direct (works when CORS allows, e.g. same-origin reverse proxy)
+      try {
+        const data = await fetchJson(target);
+        if (Array.isArray(data)) return data;
+      } catch { /* CORS or network */ }
+
+      // Public relay (best-effort; often rate-limited or down)
+      try {
+        const wrapped = 'https://api.allorigins.win/get?url=' + encodeURIComponent(target);
+        const envelope = await fetchJson(wrapped);
+        if (envelope && typeof envelope.contents === 'string') {
+          const data = JSON.parse(envelope.contents);
+          if (Array.isArray(data)) return data;
+        }
+      } catch { /* proxy down */ }
+
+      return null; // unavailable from this origin
+    }
+
+    function pickLatestFlight(flights, callsign) {
+      if (!Array.isArray(flights) || !flights.length) return null;
+      const cs = (callsign || '').trim().toUpperCase();
+      let list = flights.slice();
+      if (cs) {
+        const matched = list.filter(f => (f.callsign || '').trim().toUpperCase() === cs);
+        if (matched.length) list = matched;
+      }
+      list.sort((a, b) => (b.lastSeen || 0) - (a.lastSeen || 0));
+      return list[0];
+    }
+
+    function linksForCallsign(callsign) {
+      const icaoCs = (callsign || '').trim().toUpperCase().replace(/\s+/g, '');
+      const iataCs = iataFlightNumber(icaoCs);
+      const googleQ = encodeURIComponent((iataCs || icaoCs) + ' flight status');
+      const faIdent = encodeURIComponent(icaoCs || iataCs);
+      return {
+        google: `https://www.google.com/search?q=${googleQ}`,
+        flightaware: `https://www.flightaware.com/live/flight/${faIdent}`,
+        label: iataCs || icaoCs || 'flight'
+      };
+    }
+
+    // Resolve route ONLY from live OpenSky track data (or unknown + lookup links).
+    // Never invent airports from stale schedule DBs.
+    async function resolveRouteForAircraft(ac) {
+      const hex = (ac.hex || '').toLowerCase();
+      const cs = callsignKey(ac);
+      const links = linksForCallsign(cs);
+
+      if (!hex) {
+        return {
+          origin: null,
+          dest: null,
+          source: 'none',
+          confidence: 'unknown',
+          note: 'No ICAO hex — use lookup links',
+          links
+        };
+      }
+
+      const cached = openSkyCache.get(hex);
+      if (cached && (Date.now() - cached.at) < OPENSKY_TTL_MS) {
+        return { ...cached.route, links };
+      }
+
+      if (openSkyInflight.has(hex)) {
+        const route = await openSkyInflight.get(hex);
+        return { ...route, links };
+      }
+
+      const p = (async () => {
+        const flights = await fetchOpenSkyFlights(hex);
+        if (!flights) {
+          return {
+            origin: null,
+            dest: null,
+            source: 'opensky-blocked',
+            confidence: 'unknown',
+            note: 'Live airport data blocked in browser (CORS). Use Google / FlightAware for verified From → Landing.',
+            links
+          };
+        }
+        const fl = pickLatestFlight(flights, cs);
+        if (!fl) {
+          return {
+            origin: null,
+            dest: null,
+            source: 'opensky',
+            confidence: 'unknown',
+            note: 'OpenSky has no recent flight for this airframe. Use lookup links.',
+            links
+          };
+        }
+        const origin = fl.estDepartureAirport ? lookupAirport(fl.estDepartureAirport) : null;
+        const dest = fl.estArrivalAirport ? lookupAirport(fl.estArrivalAirport) : null;
+        let note = 'From OpenSky live track (not a schedule DB)';
+        if (origin && !dest) note = 'Departure from OpenSky live track · destination still unknown (en route)';
+        if (!origin && dest) note = 'Arrival from OpenSky live track · departure unknown';
+        if (!origin && !dest) note = 'OpenSky saw this flight but could not estimate airports yet';
+        return {
+          origin,
+          dest,
+          source: 'opensky',
+          confidence: (origin || dest) ? 'live' : 'unknown',
+          note,
+          links,
+          openSky: {
+            firstSeen: fl.firstSeen,
+            lastSeen: fl.lastSeen,
+            depDist: fl.estDepartureAirportHorizDistance,
+            arrDist: fl.estArrivalAirportHorizDistance
+          }
+        };
+      })();
+
+      openSkyInflight.set(hex, p);
+      try {
+        const route = await p;
+        openSkyCache.set(hex, { at: Date.now(), route });
+        return { ...route, links };
+      } finally {
+        openSkyInflight.delete(hex);
+      }
+    }
+
+    async function ensureRoute(ac) {
+      return resolveRouteForAircraft(ac);
+    }
+
+    // Only use cached live route when refreshing an open popup — never invent.
+    function currentRouteFor(ac) {
+      const hex = (ac?.hex || '').toLowerCase();
+      if (!hex) return null;
+      const cached = openSkyCache.get(hex);
+      if (cached && (Date.now() - cached.at) < OPENSKY_TTL_MS) {
+        const links = linksForCallsign(callsignKey(ac));
+        return { ...cached.route, links };
+      }
+      return null; // popup open handler will load
+    }
+
+    function legHTML(kind, label, main, sub) {
       const subHtml = sub ? `<div class="ac-leg-sub">${esc(sub)}</div>` : '';
-      return `<div class="ac-leg ac-leg-${kind}${noteClass ? ' ' + noteClass : ''}">
+      return `<div class="ac-leg ac-leg-${kind}">
         <div class="ac-leg-label">${esc(label)}</div>
         <div class="ac-leg-main">${esc(main)}</div>
         ${subHtml}
       </div>`;
     }
 
-    function routeCardHTML(fromMain, fromSub, toMain, toSub, note) {
+    function routeCardHTML(fromMain, fromSub, toMain, toSub, note, links) {
       const noteHtml = note ? `<div class="ac-route-note">${esc(note)}</div>` : '';
+      let linksHtml = '';
+      if (links) {
+        linksHtml = `<div class="ac-links">
+          <a class="ac-link" href="${esc(links.google)}" target="_blank" rel="noopener noreferrer">Google status</a>
+          <a class="ac-link" href="${esc(links.flightaware)}" target="_blank" rel="noopener noreferrer">FlightAware</a>
+        </div>`;
+      }
       return `<div class="ac-route">
         <div class="ac-legs">
           ${legHTML('from', 'From', fromMain, fromSub)}
@@ -328,17 +631,17 @@
           ${legHTML('to', 'Landing', toMain, toSub)}
         </div>
         ${noteHtml}
+        ${linksHtml}
       </div>`;
     }
 
-    // route: undefined = still loading / not requested; null = unknown; object = known
     function popupHTML(ac, route) {
       const cs = (ac.flight || '').trim() || (ac.r || '').trim() || (ac.hex || '—').toUpperCase();
       const reg = (ac.r || '').trim();
       const typeCode = ac.t || '';
       const typeDesc = ac.desc || '';
       const typeLine = typeCode || typeDesc || '—';
-      const operator = ac.ownOp || (route && route.airline) || '';
+      const operator = ac.ownOp || '';
 
       const altRaw = ac.alt_baro;
       const alt = altRaw != null && altRaw !== 'ground'
@@ -359,31 +662,33 @@
       const trackStr = trackComp ? `${track}<span class="dim">${trackComp}</span>` : track;
       const squawk = ac.squawk || '—';
 
+      const links = (route && route.links) || linksForCallsign(callsignKey(ac));
+
       let routeBlock;
       if (route === undefined) {
-        routeBlock = `<div class="ac-route"><div class="ac-route-pending">Looking up from / landing…</div></div>`;
+        routeBlock = `<div class="ac-route">
+          <div class="ac-route-pending">Checking live From / Landing…</div>
+          <div class="ac-links">
+            <a class="ac-link" href="${esc(links.google)}" target="_blank" rel="noopener noreferrer">Google status</a>
+            <a class="ac-link" href="${esc(links.flightaware)}" target="_blank" rel="noopener noreferrer">FlightAware</a>
+          </div>
+        </div>`;
       } else if (route && (route.origin || route.dest)) {
-        // Scheduled origin + destination (landing airport)
         const fromMain = route.origin ? airportCode(route.origin) : '—';
-        const fromSub = route.origin ? airportPlace(route.origin) : 'Origin unknown';
+        const fromSub = route.origin ? (airportPlace(route.origin) || '') : 'Unknown';
         const toMain = route.dest ? airportCode(route.dest) : '—';
-        const toSub = route.dest ? airportPlace(route.dest) : 'Destination unknown';
-        routeBlock = routeCardHTML(fromMain, fromSub, toMain, toSub, null);
+        const toSub = route.dest ? (airportPlace(route.dest) || '') : (route.origin ? 'En route / unknown' : 'Unknown');
+        routeBlock = routeCardHTML(fromMain, fromSub, toMain, toSub, route.note, links);
       } else {
-        // No schedule: approximate direction of origin vs travel / landing direction
-        const fromComp = ac.track != null ? compass16(ac.track + 180) : null;
-        const toComp = ac.track != null ? compass16(ac.track) : null;
-        if (fromComp || toComp) {
-          routeBlock = routeCardHTML(
-            fromComp || '—',
-            fromComp ? 'Direction of origin' : '',
-            toComp || '—',
-            toComp ? 'Heading / toward landing' : '',
-            'Schedule not found — showing track-based directions'
-          );
-        } else {
-          routeBlock = `<div class="ac-route"><div class="ac-route-pending">From / landing unavailable</div></div>`;
-        }
+        // No invented airports — honest empty state + verified lookup links
+        routeBlock = routeCardHTML(
+          '—',
+          'Not from live track',
+          '—',
+          'Not from live track',
+          (route && route.note) || 'Airport codes not available from live track. Use Google / FlightAware for verified From → Landing (same as double-checking the flight number).',
+          links
+        );
       }
 
       const subParts = [];
@@ -419,35 +724,31 @@
       return { maxWidth: 300, minWidth: 220, className: 'ac-popup-wrap', autoPanPadding: [60, 60] };
     }
 
-    // Live-update route section when popup is open
     function wirePopupRoute(marker, id) {
       marker.on('popupopen', async () => {
         const p = aircraft[id];
         if (!p?.ac) return;
-        const cs = callsignKey(p.ac);
-        if (!cs) {
-          marker.setPopupContent(popupHTML(p.ac, null));
-          return;
-        }
-        if (routeResolved.has(cs)) {
-          marker.setPopupContent(popupHTML(p.ac, routeResolved.get(cs)));
-        } else {
-          marker.setPopupContent(popupHTML(p.ac, undefined));
-        }
-        const route = await ensureRoute(cs);
-        if (aircraft[id] && marker.isPopupOpen()) {
-          marker.setPopupContent(popupHTML(aircraft[id].ac, route));
+        // Show loading + links immediately (links always work)
+        marker.setPopupContent(popupHTML(p.ac, undefined));
+        try {
+          const route = await ensureRoute(p.ac);
+          if (aircraft[id] && marker.isPopupOpen()) {
+            marker.setPopupContent(popupHTML(aircraft[id].ac, route));
+          }
+        } catch (e) {
+          console.warn('route lookup failed', e);
+          if (aircraft[id] && marker.isPopupOpen()) {
+            marker.setPopupContent(popupHTML(aircraft[id].ac, {
+              origin: null,
+              dest: null,
+              note: 'Route lookup failed. Use Google / FlightAware links.',
+              links: linksForCallsign(callsignKey(aircraft[id].ac)),
+              confidence: 'unknown',
+              source: 'error'
+            }));
+          }
         }
       });
-    }
-
-    function currentRouteFor(ac) {
-      const cs = callsignKey(ac);
-      if (!cs) return null;
-      if (routeResolved.has(cs)) return routeResolved.get(cs);
-      // Kick off lookup in background for next open / next refresh
-      ensureRoute(cs);
-      return undefined;
     }
 
     function lerp(a, b, t) {
