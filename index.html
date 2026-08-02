@@ -78,20 +78,38 @@
       background: rgba(56, 189, 248, 0.08);
       border: 1px solid rgba(100, 180, 255, 0.22);
       border-radius: 9px;
-      padding: 8px 10px;
+      padding: 10px;
       margin-bottom: 10px;
     }
-    .ac-route-label {
-      font-size: 10px; text-transform: uppercase; letter-spacing: 0.08em;
-      color: #64748b; margin-bottom: 4px;
-    }
-    .ac-route-codes {
-      font-size: 15px; font-weight: 650; color: #f8fafc;
-      font-variant-numeric: tabular-nums; letter-spacing: 0.02em;
-    }
-    .ac-route-codes .arrow { color: #38bdf8; margin: 0 6px; font-weight: 500; }
-    .ac-route-cities { font-size: 11px; color: #94a3b8; margin-top: 3px; }
     .ac-route-pending { font-size: 12px; color: #64748b; font-style: italic; }
+    .ac-legs {
+      display: grid;
+      grid-template-columns: 1fr 18px 1fr;
+      gap: 4px 6px;
+      align-items: start;
+    }
+    .ac-leg-label {
+      font-size: 10px; text-transform: uppercase; letter-spacing: 0.08em;
+      color: #64748b; margin-bottom: 3px;
+    }
+    .ac-leg-main {
+      font-size: 15px; font-weight: 700; color: #f8fafc;
+      font-variant-numeric: tabular-nums; letter-spacing: 0.02em;
+      line-height: 1.15;
+    }
+    .ac-leg-from .ac-leg-main { color: #c4b5fd; }
+    .ac-leg-to .ac-leg-main { color: #7dd3fc; }
+    .ac-leg-sub {
+      font-size: 11px; color: #94a3b8; margin-top: 3px; line-height: 1.3;
+      word-break: break-word;
+    }
+    .ac-leg-arrow {
+      color: #38bdf8; font-size: 15px; font-weight: 600;
+      text-align: center; padding-top: 18px; line-height: 1;
+    }
+    .ac-route-note {
+      margin-top: 8px; font-size: 10px; color: #64748b; line-height: 1.3;
+    }
     .ac-grid {
       display: grid;
       grid-template-columns: 40px 1fr;
@@ -252,7 +270,7 @@
           }
           const data = await res.json();
           const fr = data?.response?.flightroute;
-          if (!fr?.origin) {
+          if (!fr || (!fr.origin && !fr.destination)) {
             routeResolved.set(cs, null);
             return null;
           }
@@ -286,15 +304,40 @@
       return ap.iata || ap.icao || '—';
     }
 
+    function airportPlace(ap) {
+      if (!ap) return '';
+      return ap.city || ap.name || '';
+    }
+
+    // One side of the From / Landing pair
+    function legHTML(kind, label, main, sub, noteClass) {
+      const subHtml = sub ? `<div class="ac-leg-sub">${esc(sub)}</div>` : '';
+      return `<div class="ac-leg ac-leg-${kind}${noteClass ? ' ' + noteClass : ''}">
+        <div class="ac-leg-label">${esc(label)}</div>
+        <div class="ac-leg-main">${esc(main)}</div>
+        ${subHtml}
+      </div>`;
+    }
+
+    function routeCardHTML(fromMain, fromSub, toMain, toSub, note) {
+      const noteHtml = note ? `<div class="ac-route-note">${esc(note)}</div>` : '';
+      return `<div class="ac-route">
+        <div class="ac-legs">
+          ${legHTML('from', 'From', fromMain, fromSub)}
+          <div class="ac-leg-arrow" aria-hidden="true">→</div>
+          ${legHTML('to', 'Landing', toMain, toSub)}
+        </div>
+        ${noteHtml}
+      </div>`;
+    }
+
     // route: undefined = still loading / not requested; null = unknown; object = known
     function popupHTML(ac, route) {
       const cs = (ac.flight || '').trim() || (ac.r || '').trim() || (ac.hex || '—').toUpperCase();
       const reg = (ac.r || '').trim();
       const typeCode = ac.t || '';
       const typeDesc = ac.desc || '';
-      const typeLine = typeCode
-        ? (typeDesc ? `${typeCode}` : typeCode)
-        : (typeDesc || '—');
+      const typeLine = typeCode || typeDesc || '—';
       const operator = ac.ownOp || (route && route.airline) || '';
 
       const altRaw = ac.alt_baro;
@@ -318,27 +361,29 @@
 
       let routeBlock;
       if (route === undefined) {
-        routeBlock = `<div class="ac-route"><div class="ac-route-pending">Looking up route…</div></div>`;
-      } else if (!route || !route.origin) {
-        // Fallback: direction aircraft is coming from = opposite of track
-        const fromComp = ac.track != null ? compass16(ac.track + 180) : null;
-        routeBlock = fromComp
-          ? `<div class="ac-route">
-              <div class="ac-route-label">Coming from</div>
-              <div class="ac-route-codes">${esc(fromComp)}</div>
-              <div class="ac-route-cities">Route not in schedule DB</div>
-            </div>`
-          : `<div class="ac-route"><div class="ac-route-pending">Route unavailable</div></div>`;
+        routeBlock = `<div class="ac-route"><div class="ac-route-pending">Looking up from / landing…</div></div>`;
+      } else if (route && (route.origin || route.dest)) {
+        // Scheduled origin + destination (landing airport)
+        const fromMain = route.origin ? airportCode(route.origin) : '—';
+        const fromSub = route.origin ? airportPlace(route.origin) : 'Origin unknown';
+        const toMain = route.dest ? airportCode(route.dest) : '—';
+        const toSub = route.dest ? airportPlace(route.dest) : 'Destination unknown';
+        routeBlock = routeCardHTML(fromMain, fromSub, toMain, toSub, null);
       } else {
-        const from = airportCode(route.origin);
-        const to = airportCode(route.dest);
-        const cities = [route.origin.city, route.dest?.city].filter(Boolean).join(' → ');
-        const fromName = route.origin.city || route.origin.name || from;
-        routeBlock = `<div class="ac-route">
-          <div class="ac-route-label">Coming from · route</div>
-          <div class="ac-route-codes">${esc(from)}<span class="arrow">→</span>${esc(to)}</div>
-          <div class="ac-route-cities">${esc(cities || fromName)}</div>
-        </div>`;
+        // No schedule: approximate direction of origin vs travel / landing direction
+        const fromComp = ac.track != null ? compass16(ac.track + 180) : null;
+        const toComp = ac.track != null ? compass16(ac.track) : null;
+        if (fromComp || toComp) {
+          routeBlock = routeCardHTML(
+            fromComp || '—',
+            fromComp ? 'Direction of origin' : '',
+            toComp || '—',
+            toComp ? 'Heading / toward landing' : '',
+            'Schedule not found — showing track-based directions'
+          );
+        } else {
+          routeBlock = `<div class="ac-route"><div class="ac-route-pending">From / landing unavailable</div></div>`;
+        }
       }
 
       const subParts = [];
