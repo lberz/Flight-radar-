@@ -28,22 +28,28 @@
       border: none !important;
     }
     .plane-icon {
-      width: 28px;
-      height: 28px;
+      width: 32px;
+      height: 32px;
       display: flex;
       align-items: center;
       justify-content: center;
-      filter: drop-shadow(0 0 4px currentColor);
       /* Nose-up SVG; rotate() is applied so 0° = north / track heading */
       transform-origin: center center;
       transition: transform 0.35s ease-out;
       will-change: transform;
+      filter: drop-shadow(0 1px 2px rgba(0,0,0,0.65));
     }
     .plane-icon svg {
       display: block;
-      width: 26px;
-      height: 26px;
+      width: 30px;
+      height: 30px;
       overflow: visible;
+    }
+    .plane-icon.plane-high {
+      filter:
+        drop-shadow(0 0 0.6px #fff)
+        drop-shadow(0 0 1.2px #fff)
+        drop-shadow(0 1px 2px rgba(0,0,0,0.55));
     }
     .leaflet-popup-content-wrapper {
       background: #0f172a; color: #e5e7eb; border-radius: 12px;
@@ -185,27 +191,61 @@
     //         startLat, startLon, targetLat, targetLon, animStart }
     const aircraft = {};
 
-    // Nose points UP (north) at 0°. CSS rotate(track) then matches ADS-B track
-    // (0° = north, 90° = east). The old ✈ glyph faces ~NE, so bare track looked wrong.
-    function planeIcon(track, alt) {
-      let color = '#9ca3af';
-      if (alt != null) {
-        if (alt < 5000) color = '#22c55e';
-        else if (alt < 15000) color = '#eab308';
-        else if (alt < 30000) color = '#f97316';
-        else color = '#ef4444';
+    // Nose points UP (north) at 0°. CSS rotate(track) matches ADS-B track.
+    // Colors: gray = ground, green = airborne, green + white outline = above 8000 ft.
+    function planeVisualStyle(alt) {
+      const onGround = alt === 'ground' || alt === 0 || alt === '0';
+      const altNum = (typeof alt === 'number' && isFinite(alt)) ? alt : null;
+      if (onGround || (altNum != null && altNum < 50)) {
+        return { color: '#9ca3af', high: false }; // gray — on the ground
       }
+      if (altNum != null && altNum > 8000) {
+        return { color: '#22c55e', high: true };  // green + white outline
+      }
+      // Airborne (including unknown numeric alt treated as in air if not ground)
+      return { color: '#22c55e', high: false };
+    }
+
+    // Top-down airliner silhouette (nose up)
+    function planeSvgHtml(color, high) {
+      const stroke = high
+        ? 'stroke="#ffffff" stroke-width="1.35" stroke-linejoin="round" paint-order="stroke fill"'
+        : 'stroke="rgba(0,0,0,0.35)" stroke-width="0.4" stroke-linejoin="round"';
+      // Fuselage + wings + tailplane — reads as a plane, not a star
+      return `<svg viewBox="0 0 32 32" aria-hidden="true" focusable="false">
+        <path fill="${color}" ${stroke} d="
+          M16 2.2
+          C16.9 2.2 17.5 3.1 17.45 4.1
+          L17.15 10.2
+          L27.5 14.1
+          C28.2 14.35 28.2 15.35 27.5 15.55
+          L17.2 18.2
+          L16.85 24.6
+          L20.4 27.1
+          C20.9 27.45 20.7 28.3 20.1 28.3
+          L16 26.9
+          L11.9 28.3
+          C11.3 28.3 11.1 27.45 11.6 27.1
+          L15.15 24.6
+          L14.8 18.2
+          L4.5 15.55
+          C3.8 15.35 3.8 14.35 4.5 14.1
+          L14.85 10.2
+          L14.55 4.1
+          C14.5 3.1 15.1 2.2 16 2.2
+          Z"/>
+      </svg>`;
+    }
+
+    function planeIcon(track, alt) {
+      const { color, high } = planeVisualStyle(alt);
       const heading = (track != null && isFinite(track)) ? track : 0;
+      const cls = high ? 'plane-icon plane-high' : 'plane-icon';
       return L.divIcon({
         className: 'plane-marker',
-        iconSize: [28, 28],
-        iconAnchor: [14, 14],
-        html: `<div class="plane-icon" style="color:${color};transform:rotate(${heading}deg)">
-          <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
-            <!-- Simple aircraft silhouette; nose at top (north) -->
-            <path fill="currentColor" d="M12 2 L14.8 10.2 L22 12 L14.8 13.2 L13.2 22 L12 18.6 L10.8 22 L9.2 13.2 L2 12 L9.2 10.2 Z"/>
-          </svg>
-        </div>`
+        iconSize: [32, 32],
+        iconAnchor: [16, 16],
+        html: `<div class="${cls}" style="transform:rotate(${heading}deg)">${planeSvgHtml(color, high)}</div>`
       });
     }
 
@@ -231,21 +271,26 @@
       return (fallback != null && isFinite(fallback)) ? fallback : 0;
     }
 
-    // Update rotation/color without always rebuilding the icon when possible
+    // Update heading / altitude styling; rebuild icon when band changes (outline needs SVG)
     function applyPlaneVisual(plane, heading, alt) {
+      const prevHigh = plane._high;
+      const prevGround = plane._ground;
+      const { high } = planeVisualStyle(alt);
+      const onGround = alt === 'ground' || alt === 0 || alt === '0' ||
+        (typeof alt === 'number' && isFinite(alt) && alt < 50);
       plane.track = heading;
       plane.alt = alt;
+      plane._high = high;
+      plane._ground = onGround;
+
+      // Outline / ground vs air needs SVG path attributes — rebuild when band flips
+      if (prevHigh !== high || prevGround !== onGround || !plane.marker.getElement()) {
+        plane.marker.setIcon(planeIcon(heading, alt));
+        return;
+      }
       const el = plane.marker.getElement()?.querySelector('.plane-icon');
       if (el) {
         el.style.transform = `rotate(${heading}deg)`;
-        let color = '#9ca3af';
-        if (alt != null) {
-          if (alt < 5000) color = '#22c55e';
-          else if (alt < 15000) color = '#eab308';
-          else if (alt < 30000) color = '#f97316';
-          else color = '#ef4444';
-        }
-        el.style.color = color;
       } else {
         plane.marker.setIcon(planeIcon(heading, alt));
       }
